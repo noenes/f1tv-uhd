@@ -1,7 +1,10 @@
 # F1TV 4K UHD patch — Sony Bravia (Android TV)
 
-Patch the F1TV app (`com.formulaone.production`) to stream in 4K UHD on a Sony
-Bravia TV. By default the app only offers HD, even with a 4K Pro subscription.
+![F1TV running on Sony Bravia](screenshot.png)
+
+Patch the F1TV app (`com.formulaone.production`) to stream in **4K UHD HDR10+**
+on a Sony Bravia TV. By default the app only offers HD, even with a 4K Pro
+subscription.
 
 > **Personal use only.** You need a valid F1TV subscription. Do not distribute
 > patched APKs.
@@ -11,10 +14,10 @@ Bravia TV. By default the app only offers HD, even with a 4K Pro subscription.
 ## How it works
 
 F1TV gates 4K by only sending the `x-f1-override-video-drm` header in
-`CONTENT_PLAY` requests when an internal diagnostics flag is enabled (which it
-never is in release builds). This patch removes those two guards and hardcodes
-the header value `HDR_UHD_CMAFWV`, so every stream request asks the backend for
-the 4K HDR Widevine stream.
+`CONTENT_PLAY` requests when an internal diagnostics flag is enabled — which it
+never is in release builds. This patch removes those two guards and hardcodes
+the value `HDR_UHD_CMAFWV`, so every stream request asks the backend for the
+4K HDR Widevine stream.
 
 Three binary patches are applied directly to `classes4.dex`:
 
@@ -23,6 +26,15 @@ Three binary patches are applied directly to `classes4.dex`:
 | 1 | `DeviceSupportImpl.validateIsUhdSupportedDevice()` | UHD device-whitelist always passes |
 | 2 | `DiagnosticsPreferenceManagerImpl.getDrmHeaderOverride()` | Bypasses `isDiagnosticsEnabled()` guard, hardcodes `"HDR_UHD_CMAFWV"` as default |
 | 3 | `Headers$BuilderImpl.getOverrideVideoDRM()` | Bypasses second `isDiagnosticsEnabled()` guard |
+
+### Verification
+
+After patching, ADB logcat confirms 4K HDR10+ decoding on every frame:
+
+```
+VCodecDrv: VDEC_DRV_GET_TYPE_HDR10PLUS_INFO
+hwcomposer: buffer is 2k but exist 4k layer
+```
 
 ---
 
@@ -84,13 +96,12 @@ Patch 3 (getOverrideVideoDRM):  match op 0x0034bdba
 Klaar! Patched APK: f1tv_patched_unsigned.apk
 ```
 
-If a patch reports "geen match gevonden", the app structure changed in this
-version — see [Updating for a new version](#updating-for-a-new-version).
+If a patch reports "geen match gevonden", the app structure changed — see
+[Updating for a new version](#updating-for-a-new-version).
 
 ### 3. Create a signing keystore
 
-You only need to do this once. The keystore is yours — keep it safe for future
-re-installs.
+You only need to do this once. Keep the keystore safe for future re-installs.
 
 ```bash
 keytool -genkeypair \
@@ -161,24 +172,19 @@ You should see:
 hwcomposer: buffer is 2k but exist 4k layer
 ```
 
-This confirms the TV is rendering a 4K video layer. UHD will also appear in the
-in-app quality settings.
-
 ---
 
 ## Updating for a new version
 
 1. Download the new APKM and extract to `unknown/`
-2. Run `python patch_dex.py` — it will report an error for any pattern that
-   changed
-3. If a patch fails, inspect the updated smali to find the new byte pattern:
+2. Run `python patch_dex.py` — it will report an error for any pattern that changed
+3. If a patch fails, inspect the updated smali:
    - Patch 2: search for `key.diagnostics.drmHeaderOverride` in
      `DiagnosticsPreferenceManagerImpl.smali`
    - Patch 3: search for `isDiagnosticsEnabled` call followed by `if-eqz`
      followed by `move-object v1, v0` in `Headers$BuilderImpl.smali`
-4. Re-sign with your **existing** keystore (no need to uninstall if same cert)
-5. Install with `adb install-multiple` (add `-r` flag to replace without
-   uninstalling if signature matches)
+4. Re-sign with your **existing** keystore (no uninstall needed if same cert)
+5. Install with `adb install-multiple`
 
 ### Decompiling smali for inspection
 
@@ -219,4 +225,4 @@ in the DEX header must be recalculated — `patch_dex.py` does this automaticall
 
 | App version | TV model | Date | Result |
 |-------------|----------|------|--------|
-| 3.0.47.1 | Sony Bravia 4K VH2 | 2026-03-08 | ✅ 4K UHD working |
+| 3.0.47.1 | Sony Bravia 4K VH2 | 2026-03-08 | ✅ 4K HDR10+ working |
