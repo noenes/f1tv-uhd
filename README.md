@@ -13,19 +13,38 @@ subscription.
 
 ## How it works
 
-F1TV gates 4K by only sending the `x-f1-override-video-drm` header in
-`CONTENT_PLAY` requests when an internal diagnostics flag is enabled — which it
-never is in release builds. This patch removes those two guards and hardcodes
-the value `HDR_UHD_CMAFWV`, so every stream request asks the backend for the
-4K HDR Widevine stream.
+F1TV gates 4K by only sending the `x-f1-override-video-stream` header (called
+`x-f1-override-video-drm` before 3.0.48) in `CONTENT_PLAY` requests when an
+internal diagnostics flag is enabled — which it never is in release builds. This
+patch removes those two guards and hardcodes the value `HDR_UHD_CMAFWV`, so the
+stream request asks the backend for the 4K HDR Widevine stream.
 
-Three binary patches are applied directly to `classes4.dex`:
+Three binary patches are applied directly to the DEX files. The script scans
+every `classesN.dex`, because R8 moves classes between dex files per release
+(e.g. in 3.0.49.4 the UHD check moved from `classes4.dex` to `classes5.dex`):
 
 | # | Location | What changes |
 |---|----------|--------------|
 | 1 | `DeviceSupportImpl.validateIsUhdSupportedDevice()` | UHD device-whitelist always passes |
 | 2 | `DiagnosticsPreferenceManagerImpl.getDrmHeaderOverride()` | Bypasses `isDiagnosticsEnabled()` guard, hardcodes `"HDR_UHD_CMAFWV"` as default |
-| 3 | `Headers$BuilderImpl.getOverrideVideoDRM()` | Bypasses second `isDiagnosticsEnabled()` guard |
+| 3 | `Headers$BuilderImpl.getOverrideVideoStream()` | Bypasses second `isDiagnosticsEnabled()` guard |
+
+Forcing 4K on *everything* breaks HD-only content (highlights → error ER1005)
+and some shows (the post-race show gets an encrypted 4K variant that renders as
+yellow/white blocks). `patch_smali.py` therefore rewrites
+`ComposerUseCaseImpl.preparePlaybackInternal()` (the `CONTENT_PLAY` call):
+
+| videoType | Behaviour |
+|-----------|-----------|
+| `REPLAY` / `LIVE` | Request with the forced 4K header; if that fails, automatically retry without it (HD) |
+| anything else (`Pseudo-VOD`, `FER`, …) | Request without the forced header — the backend picks the stream itself (4K when it has a working one, otherwise HD) |
+
+A Widevine stream without a license URL is also treated as an error (→ retry).
+The patched app logs `F1UHD` lines (`videoType`, `streamType`, `laUrl`) — check
+with `adb logcat -s F1UHD`.
+
+Only the dex containing `ComposerUseCaseImpl` is decompiled and rebuilt with
+apktool (`-r`, resources copied raw), so the aapt2 problem below does not apply.
 
 ### Verification
 
@@ -42,6 +61,7 @@ hwcomposer: buffer is 2k but exist 4k layer
 
 - Python 3.x
 - Java (JRE 8+)
+- [apktool](https://apktool.org) 3.x — `apktool.jar`
 - [uber-apk-signer](https://github.com/patrickfav/uber-apk-signer/releases) — download `uber-apk-signer.jar`
 - [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) — for `adb`
 - F1TV APKM file — download from [APKMirror](https://www.apkmirror.com/apk/formula-one-digital-media-limited/f1-tv/) (choose the APKM)
@@ -68,19 +88,14 @@ unzip F1TV_x.x.x.x.apkm -d unknown/
 
 You will see `base.apk` and several `split_config.*.apk` files.
 
-### 2. Run the patch script
+### 2. Run the patch scripts
 
-Edit the paths at the top of `patch_dex.py` if needed:
-
-```python
-APK_IN  = "unknown/base.apk"
-APK_OUT = "f1tv_patched_unsigned.apk"
-```
-
-Then run:
+First the smali patch (needs [apktool](https://apktool.org) 3.x), then the
+binary DEX patches on its output:
 
 ```bash
-python patch_dex.py
+python patch_smali.py unknown/base.apk base_smali.apk apktool.jar
+python patch_dex.py base_smali.apk f1tv_patched_unsigned.apk
 ```
 
 Expected output:
@@ -177,7 +192,7 @@ hwcomposer: buffer is 2k but exist 4k layer
 ## Updating for a new version
 
 1. Download the new APKM and extract to `unknown/`
-2. Run `python patch_dex.py` — it will report an error for any pattern that changed
+2. Run `patch_smali.py` and `patch_dex.py` (step 2) — they report an error for any pattern that changed
 3. If a patch fails, inspect the updated smali:
    - Patch 2: search for `key.diagnostics.drmHeaderOverride` in
      `DiagnosticsPreferenceManagerImpl.smali`
@@ -226,3 +241,4 @@ in the DEX header must be recalculated — `patch_dex.py` does this automaticall
 | App version | TV model | Date | Result |
 |-------------|----------|------|--------|
 | 3.0.47.1 | Sony Bravia 4K VH2 | 2026-03-08 | ✅ 4K HDR10+ working |
+| 3.0.49.4 | Sony Bravia 4K VH2 | 2026-09-26 | ✅ 4K HDR10+ races, post-race show 4K, HD fallback for highlights |

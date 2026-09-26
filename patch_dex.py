@@ -1,5 +1,6 @@
 """
-Patch classes4.dex in base.apk with three fixes:
+Patch the DEX files in base.apk with three fixes (each patch is searched in
+every classesN.dex, since R8 moves classes between dex files per release):
 
 1. validateIsUhdSupportedDevice() – bypass TiledMedia UHD device whitelist:
      if-nez v1, :cond_3  →  goto/16 :cond_3
@@ -23,10 +24,11 @@ Dalvik instruction sizes:
   nop                                =>  2 bytes (00 00)  – two nops replace 4-byte branch
 """
 
-import zipfile, shutil, os, struct, hashlib, zlib
+import zipfile, shutil, os, struct, hashlib, zlib, sys
 
-APK_IN  = "C:/Bin/claude/projects/f1tv/unknown/base.apk"
-APK_OUT = "C:/Bin/claude/projects/f1tv/f1tv_patched_unsigned.apk"
+# Usage: python patch_dex.py [base.apk] [output.apk]
+APK_IN  = sys.argv[1] if len(sys.argv) > 1 else "unknown/base.apk"
+APK_OUT = sys.argv[2] if len(sys.argv) > 2 else "f1tv_patched_unsigned.apk"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PATCH 1  –  validateIsUhdSupportedDevice (TiledMedia UHD whitelist bypass)
@@ -54,7 +56,7 @@ AFTER_UHD    = bytes([0x07, 0x01])
 #   [p+10..11] 54 30          iget-object v0, p0     (0x54=iget-object, reg3 → byte=0x30)
 #   [p+12..13] XX XX          field index
 #   [p+14..15] 1a 02          const-string v2 opcode+reg
-#   [p+16..17] KEY_LO KEY_HI  string index for "key.diagnostics.drmHeaderOverride"
+#   [p+16..17] KEY_LO KEY_HI  string index for "key.diagnostics.streamHeaderOverride"
 # Before p: invoke-interface {v0}, isDiagnosticsEnabled() ends with 00 00 (v0 register byte + pad)
 SEARCH_DRM = bytes([0x0a, 0x00, 0x1a, 0x01])  # move-result v0, const-string v1 opcode+reg
 
@@ -95,24 +97,22 @@ def find_string_index(data: bytes, target: str) -> int:
     return -1
 
 
-def patch_dex(data: bytes) -> bytes:
+def patch_dex(data: bytes) -> tuple[bytes, set]:
+    """Apply whichever patches match in this dex. Returns (dex, applied patch numbers)."""
     patched = bytearray(data)
+    applied = set()
 
-    # ── Resolve string indices ────────────────────────────────────────────────
+    # Patches 2 and 3 live next to the diagnostics key; only look in the dex that has it
     uhd_str_idx = find_string_index(data, "HDR_UHD_CMAFWV")
-    if uhd_str_idx == -1:
-        raise ValueError("String 'HDR_UHD_CMAFWV' niet gevonden in DEX string pool!")
-    print(f"  String 'HDR_UHD_CMAFWV' index: {uhd_str_idx} (0x{uhd_str_idx:04x})")
-
-    drm_key_idx = find_string_index(data, "key.diagnostics.drmHeaderOverride")
-    if drm_key_idx == -1:
-        raise ValueError("String 'key.diagnostics.drmHeaderOverride' niet gevonden in DEX string pool!")
-    print(f"  String 'key.diagnostics.drmHeaderOverride' index: {drm_key_idx} (0x{drm_key_idx:04x})")
-
-    uhd_lo = uhd_str_idx & 0xFF
-    uhd_hi = (uhd_str_idx >> 8) & 0xFF
-    key_lo = drm_key_idx & 0xFF
-    key_hi = (drm_key_idx >> 8) & 0xFF
+    drm_key_idx = find_string_index(data, "key.diagnostics.streamHeaderOverride")
+    has_drm = uhd_str_idx != -1 and drm_key_idx != -1
+    if has_drm:
+        print(f"  String 'HDR_UHD_CMAFWV' index: {uhd_str_idx} (0x{uhd_str_idx:04x})")
+        print(f"  String 'key.diagnostics.streamHeaderOverride' index: {drm_key_idx} (0x{drm_key_idx:04x})")
+        uhd_lo = uhd_str_idx & 0xFF
+        uhd_hi = (uhd_str_idx >> 8) & 0xFF
+        key_lo = drm_key_idx & 0xFF
+        key_hi = (drm_key_idx >> 8) & 0xFF
 
     # ── Patch 1: validateIsUhdSupportedDevice ─────────────────────────────────
     pos = 0
@@ -127,17 +127,20 @@ def patch_dex(data: bytes) -> bytes:
         if after_ok:   # before_ok is extra validation; after_ok alone is sufficient (matches original)
             found_uhd.append(p)
         pos = p + 1
-    if len(found_uhd) == 0:
-        raise ValueError("Patch 1 (UHD whitelist): geen match gevonden!")
     if len(found_uhd) > 1:
         raise ValueError(f"Patch 1 (UHD whitelist): meerdere matches: {[hex(x) for x in found_uhd]}")
-    p = found_uhd[0]
-    print(f"Patch 1 (UHD whitelist):        match op 0x{p:08x}")
-    print(f"  Voor: {bytes(patched[p:p+10]).hex()}")
-    patched[p + 4] = 0x29   # goto/16 opcode
-    patched[p + 5] = 0x00   # padding (was register v1)
-    # offset bytes at p+6, p+7 stay the same
-    print(f"  Na:   {bytes(patched[p:p+10]).hex()}")
+    if found_uhd:
+        p = found_uhd[0]
+        print(f"Patch 1 (UHD whitelist):        match op 0x{p:08x}")
+        print(f"  Voor: {bytes(patched[p:p+10]).hex()}")
+        patched[p + 4] = 0x29   # goto/16 opcode
+        patched[p + 5] = 0x00   # padding (was register v1)
+        # offset bytes at p+6, p+7 stay the same
+        print(f"  Na:   {bytes(patched[p:p+10]).hex()}")
+        applied.add(1)
+
+    if not has_drm:
+        return finish(patched, applied)
 
     # ── Patch 2: getDrmHeaderOverride() ──────────────────────────────────────
     # Full fingerprint search: match SEARCH_DRM + structural checks + DRM key index
@@ -178,6 +181,7 @@ def patch_dex(data: bytes) -> bytes:
     patched[p+8] = 0x00
     patched[p+9] = 0x00
     print(f"  Na:   {bytes(patched[p:p+18]).hex()}")
+    applied.add(2)
 
     # ── Patch 3: getOverrideVideoDRM() ───────────────────────────────────────
     pos = 0
@@ -205,7 +209,14 @@ def patch_dex(data: bytes) -> bytes:
     patched[p+4] = 0x00
     patched[p+5] = 0x00
     print(f"  Na:   {bytes(patched[p:p+8]).hex()}")
+    applied.add(3)
 
+    return finish(patched, applied)
+
+
+def finish(patched: bytearray, applied: set) -> tuple[bytes, set]:
+    if not applied:
+        return bytes(patched), applied
     # ── Update DEX checksums ──────────────────────────────────────────────────
     sha1 = hashlib.sha1(bytes(patched[32:])).digest()
     patched[12:32] = sha1
@@ -215,26 +226,36 @@ def patch_dex(data: bytes) -> bytes:
     patched[8:12] = adler.to_bytes(4, 'little')
     print(f"  Adler-32: {adler:#010x}")
 
-    return bytes(patched)
+    return bytes(patched), applied
 
 
-# ── Copy source APK and apply patches ────────────────────────────────────────
-shutil.copy2(APK_IN, APK_OUT)
-
+# ── Patch every dex in the APK ───────────────────────────────────────────────
+patched_dexes = {}
+applied_all = []
 with zipfile.ZipFile(APK_IN, 'r') as zin:
-    dex_data = zin.read('classes4.dex')
+    for name in zin.namelist():
+        if not (name.startswith('classes') and name.endswith('.dex')):
+            continue
+        dex_data = zin.read(name)
+        print(f"{name}: {len(dex_data)} bytes")
+        new_dex, applied = patch_dex(dex_data)
+        if applied:
+            patched_dexes[name] = new_dex
+            applied_all += sorted(applied)
 
-print(f"classes4.dex: {len(dex_data)} bytes")
-patched_dex = patch_dex(dex_data)
+for n in (1, 2, 3):
+    c = applied_all.count(n)
+    if c != 1:
+        raise ValueError(f"Patch {n}: {c} matches over alle dex-bestanden (verwacht 1)!")
 
-# Repack: copy all entries, replace classes4.dex with patched version
+# Repack: copy all entries, replace patched dex files
 tmp_out = APK_OUT + ".tmp"
 with zipfile.ZipFile(APK_IN, 'r') as zin:
     with zipfile.ZipFile(tmp_out, 'w', compression=zipfile.ZIP_STORED) as zout:
         for item in zin.infolist():
-            if item.filename == 'classes4.dex':
-                zout.writestr(item, patched_dex)
-                print(f"  classes4.dex vervangen ({len(patched_dex)} bytes)")
+            if item.filename in patched_dexes:
+                zout.writestr(item, patched_dexes[item.filename])
+                print(f"  {item.filename} vervangen")
             else:
                 zout.writestr(item, zin.read(item.filename))
 
